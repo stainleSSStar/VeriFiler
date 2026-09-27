@@ -128,3 +128,88 @@ fn known_digest_values() {
             "900150983cd24fb0d6963f7d28e17f72",
         ));
 }
+
+#[test]
+fn help_describes_commands_and_algorithms() {
+    let assert = Command::cargo_bin("verifiler").unwrap()
+        .arg("help")
+        .assert()
+        .success();
+    let out = assert.get_output().stdout.clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("calculate <FILE>"), "usage should explain calculate");
+    assert!(out.contains("verify <FILE> <MANIFEST>"), "usage should explain verify with -a");
+    assert!(out.contains("-a"), "usage should show -a option");
+    for algo in ["md5", "sha1", "sha256", "sha512", "sha3-256", "sha3-512", "blake2b-512", "blake2s-256", "blake3", "crc32"] {
+        assert!(out.contains(algo), "help should list algorithm {algo}");
+    }
+    assert!(out.contains("EXAMPLES"), "help should contain examples");
+}
+
+#[test]
+fn verify_can_select_single_algorithm() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("data.bin");
+    data.write_binary(b"payload for selective verification test").unwrap();
+
+    let manifest = dir.child("manifest.txt");
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["calculate", data.path().to_str().unwrap(), "-o", manifest.path().to_str().unwrap(), "-q"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["verify", data.path().to_str().unwrap(), manifest.path().to_str().unwrap(), "-a", "sha256"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("OK       sha256 "))
+        .stdout(predicate::str::contains("1/1 checksums matched: file is intact"));
+
+    let multi = Command::cargo_bin("verifiler").unwrap()
+        .args(["verify", data.path().to_str().unwrap(), manifest.path().to_str().unwrap(), "-a", "md5,blake3"])
+        .assert()
+        .code(0);
+    let out = String::from_utf8(multi.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("OK       md5 "), "selected md5 should be checked: {out}");
+    assert!(out.contains("OK       blake3 "), "selected blake3 should be checked: {out}");
+    assert!(out.contains("2/2 checksums matched"), "summary should count only selected: {out}");
+    assert!(!out.contains("sha1"), "unselected algorithms should be skipped: {out}");
+}
+
+#[test]
+fn verify_repeated_algo_flags_merge() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("data.bin");
+    data.write_binary(b"merge flags test").unwrap();
+
+    let manifest = dir.child("manifest.txt");
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["calculate", data.path().to_str().unwrap(), "-o", manifest.path().to_str().unwrap(), "-a", "md5,sha256", "-q"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["verify", data.path().to_str().unwrap(), manifest.path().to_str().unwrap(), "-a", "md5", "-a", "sha256"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("2/2 checksums matched"));
+}
+
+#[test]
+fn verify_selected_algorithm_missing_from_manifest_errors() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("data.bin");
+    data.write_binary(b"abc").unwrap();
+
+    let manifest = dir.child("manifest.txt");
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["calculate", data.path().to_str().unwrap(), "-o", manifest.path().to_str().unwrap(), "-a", "md5", "-q"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("verifiler").unwrap()
+        .args(["verify", data.path().to_str().unwrap(), manifest.path().to_str().unwrap(), "-a", "sha256"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no 'sha256' checksum"));
+}

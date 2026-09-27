@@ -7,10 +7,12 @@ VeriFiler computes checksums of any file with popular algorithms and writes a sm
 ## Features
 
 - **All popular algorithms**: MD5, SHA-1, SHA-256, SHA-512, SHA3-256, SHA3-512, BLAKE2b-512, BLAKE2s-256, BLAKE3, CRC32
+- **Algorithm selection**: both `calculate` and `verify` accept `-a <ALGO>[,<ALGO>...]` to use only the algorithms you want; without the flag, all algorithms are used
 - **Streaming**: single pass over the file with a 128 KB buffer — constant ~2 MB RAM regardless of file size (verified on a 2 GB file)
-- **Fast**: all algorithms computed in one disk pass (both `calculate` and `verify`)
+- **Fast**: all selected algorithms computed in one disk pass (both `calculate` and `verify`)
 - **Portable**: a single static binary, no runtime libraries required (Rust, no system dependencies)
 - **Console output**: results are always available in the terminal; `verify` prints `OK`/`FAIL` per algorithm and a clear final verdict
+- **Built-in help**: `verifiler help` explains every command, option, algorithm and exit code
 
 ## Installation
 
@@ -29,36 +31,54 @@ cargo install --path .
 
 ## Usage
 
+Run `verifiler help` for the full reference:
+
+```
+USAGE:
+    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [-q]
+    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]]
+    verifiler help
+    verifiler version
+```
+
 ### Calculate
 
 ```sh
-# Compute all algorithms and write manifest to file (also prints to console)
+# All algorithms, write manifest to file (also prints to console)
 verifiler calculate myfile.iso -o myfile.iso.vf
 
-# Compute and print to stdout only (no manifest file)
+# All algorithms, print to stdout only (no manifest file)
 verifiler calculate myfile.iso
 
-# Only selected algorithms, quiet (manifest only, no console output)
+# Only selected algorithms (single or comma-separated list)
+verifiler calculate myfile.iso -a md5
 verifiler calculate myfile.iso -o checksums.txt -a md5,sha256,blake3 -q
 ```
 
 ### Verify
 
 ```sh
-# Check downloaded file against manifest (e.g. after downloading from the internet)
+# Check downloaded file against the manifest (e.g. after downloading from the internet)
 verifiler verify myfile.iso myfile.iso.vf
+
+# Verify only selected algorithm(s); they must exist in the manifest
+verifiler verify myfile.iso myfile.iso.vf -a sha256
+verifiler verify myfile.iso myfile.iso.vf -a md5,blake3
 ```
 
-Output example:
+Output example (`verify myfile.iso myfile.iso.vf -a md5,sha256`):
 
 ```
 OK       md5 e5c9b7be5d42cb48a7c2df30c5a305d8
 OK       sha256 e9dacdd20ce34559da69c69bc9ac0258b8433622953fa59a68642324baa77606
-...
-10/10 checksums matched: file is intact
+2/2 checksums matched: file is intact
 ```
 
 Exit codes: `0` intact, `1` corrupted/verification error, `2` usage error.
+
+### Supported algorithms
+
+`md5`, `sha1`, `sha256`, `sha512`, `sha3-256`, `sha3-512`, `blake2b-512`, `blake2s-256`, `blake3`, `crc32`
 
 ### Manifest format
 
@@ -75,7 +95,8 @@ The manifest can be edited manually (e.g. keep only the algorithms you trust), t
 ## Typical workflow
 
 1. **Sender**: `verifiler calculate bigfile.zip -o bigfile.zip.vf` and publish both files.
-2. **Receiver**: download both, then `verifiler verify bigfile.zip bigfile.zip.vf`.
+2. **Receiver**: download both, then `verifiler verify bigfile.zip bigfile.zip.vf`
+   (or check just one algorithm: `verifiler verify bigfile.zip bigfile.zip.vf -a sha256`).
 3. Exit code `0` and `file is intact` → the downloaded copy is byte-for-byte identical.
 
 ## Performance & memory
@@ -91,7 +112,7 @@ Measured on a 2 GB file (all 10 algorithms, single pass):
 ## Development
 
 ```sh
-cargo test --release    # integration tests (roundtrip, corruption, CLI)
+cargo test --release    # 12 integration tests (roundtrip, corruption, CLI, selection)
 ```
 
 ## License

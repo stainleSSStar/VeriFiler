@@ -46,14 +46,16 @@ fn run(cmd: cli::Command) -> i32 {
                 1
             }
         },
-        cli::Command::Verify { file, manifest } => match verify(&file, &manifest) {
-            Ok(true) => 0,
-            Ok(false) => 1,
-            Err(e) => {
-                eprintln!("verifiler: {e}");
-                1
+        cli::Command::Verify { file, manifest, algorithms } => {
+            match verify(&file, &manifest, &algorithms) {
+                Ok(true) => 0,
+                Ok(false) => 1,
+                Err(e) => {
+                    eprintln!("verifiler: {e}");
+                    1
+                }
             }
-        },
+        }
     }
 }
 
@@ -111,14 +113,29 @@ fn calculate(
     Ok(())
 }
 
-fn verify(file: &str, manifest_path: &str) -> Result<bool, String> {
+fn verify(file: &str, manifest_path: &str, only: &[algo::Algorithm]) -> Result<bool, String> {
     let expected = manifest::parse_manifest(manifest_path)
         .map_err(|e| format!("cannot read manifest '{manifest_path}': {e}"))?;
     if expected.is_empty() {
         return Err(format!("manifest '{manifest_path}' contains no checksums"));
     }
 
-    let algorithms: Vec<algo::Algorithm> = expected
+    let selected: Vec<&manifest::ManifestEntry> = if only.is_empty() {
+        expected.iter().collect()
+    } else {
+        let mut picked = Vec::with_capacity(only.len());
+        for algo in only {
+            let name = algo.name();
+            let found = expected
+                .iter()
+                .find(|e| e.algorithm == name)
+                .ok_or_else(|| format!("manifest '{manifest_path}' has no '{name}' checksum"))?;
+            picked.push(found);
+        }
+        picked
+    };
+
+    let algorithms: Vec<algo::Algorithm> = selected
         .iter()
         .map(|e| algo::Algorithm::from_name(&e.algorithm))
         .collect::<Result<Vec<_>, _>>()?;
@@ -132,7 +149,8 @@ fn verify(file: &str, manifest_path: &str) -> Result<bool, String> {
     let stderr = io::stderr();
     let mut err = io::BufWriter::new(stderr.lock());
 
-    for (entry, actual) in expected.iter().zip(actual_hashes) {
+    for (entry, actual) in selected.iter().zip(actual_hashes) {
+        let entry = *entry;
         if actual.eq_ignore_ascii_case(&entry.hash) {
             ok_count += 1;
             let _ = writeln!(out, "OK       {} {}", entry.algorithm, actual);
@@ -149,9 +167,9 @@ fn verify(file: &str, manifest_path: &str) -> Result<bool, String> {
     }
 
     if all_ok {
-        let _ = writeln!(out, "{}/{} checksums matched: file is intact", ok_count, expected.len());
+        let _ = writeln!(out, "{}/{} checksums matched: file is intact", ok_count, selected.len());
     } else {
-        let _ = writeln!(err, "{}/{} checksums matched: file is CORRUPTED", ok_count, expected.len());
+        let _ = writeln!(err, "{}/{} checksums matched: file is CORRUPTED", ok_count, selected.len());
     }
     let _ = out.flush();
     let _ = err.flush();
