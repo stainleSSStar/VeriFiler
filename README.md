@@ -4,6 +4,100 @@ Portable, fast, low-memory console tool for file integrity verification.
 
 VeriFiler computes checksums of any file with popular algorithms and writes a small text *manifest*. Anyone who later downloads that file can feed it — together with the manifest — back to VeriFiler to confirm the file is intact.
 
+## Quick start
+
+### Option A — download a ready binary (no build required)
+
+Go to the [**Releases**](https://github.com/stainleSSStar/VeriFiler/releases) page and download the archive for your system:
+
+| File | System |
+|---|---|
+| `verifiler-*-linux-x64.tar.gz` | Linux (Intel/AMD 64-bit) |
+| `verifiler-*-linux-arm64.tar.gz` | Linux (ARM 64-bit, e.g. Raspberry Pi 4/5) |
+| `verifiler-*-macos-x64.tar.gz` | macOS (Intel) |
+| `verifiler-*-macos-arm64.tar.gz` | macOS (Apple Silicon M1/M2/M3/M4) |
+| `verifiler-*-windows-x64.zip` | Windows 64-bit |
+
+Then unpack and test:
+
+**Linux / macOS:**
+```sh
+tar -xzf verifiler-*-linux-x64.tar.gz
+./verifiler help
+./verifiler calculate README.md          # checksums of any file, printed to console
+```
+
+**Windows (PowerShell):**
+```powershell
+Expand-Archive verifiler-*-windows-x64.zip
+.\verifiler.exe help
+.\verifiler.exe calculate README.md
+```
+
+> Releases are attached to git tags (`v0.1.0`, …). Until the first tag exists, CI still produces binaries on every push — grab them from **Actions → latest run → Artifacts** (the `linux-x64` artifact contains the `tar.gz`). You need to be logged in to GitHub to download artifacts.
+
+### Option B — build from source
+
+**Step 1: install the Rust toolchain** (the only requirement; works on Linux, macOS and Windows):
+
+Go to [https://rustup.rs](https://rustup.rs) and follow the instructions, or run:
+
+**Linux / macOS:**
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+**Windows:** download and run [rustup-init.exe](https://win.rustup.rs/x86_64), accept the defaults, then open a new terminal.
+
+Verify the installation:
+```sh
+rustc --version    # should print e.g. rustc 1.xx.x
+cargo --version
+```
+
+**Step 2: get the source:**
+```sh
+git clone https://github.com/stainleSSStar/VeriFiler.git
+cd VeriFiler
+```
+
+**Step 3: build:**
+```sh
+cargo build --release
+```
+The binary appears at `target/release/verifiler` (Linux/macOS) or `target\release\verifiler.exe` (Windows). It is fully self-contained — only the standard system libraries are needed, nothing else to install.
+
+**Step 4 (optional): make it available everywhere:**
+```sh
+cargo install --path .    # installs to ~/.cargo/bin/verifiler
+```
+
+### Your first test (60 seconds)
+
+```sh
+# 1. Pick or create any file
+echo "hello integrity" > test.txt
+
+# 2. Calculate all checksums into a manifest
+verifiler calculate test.txt -o test.txt.vf
+
+# 3. Verify the intact file — passes
+verifiler verify test.txt test.txt.vf
+# -> OK lines, "10/10 checksums matched: file is intact", exit code 0
+
+# 4. Corrupt the file (simulate a broken download) and verify again
+echo "hello integrity CORRUPTED" > test.txt
+verifiler verify test.txt test.txt.vf
+# -> FAIL lines, "0/10 checksums matched: file is CORRUPTED", exit code 1
+
+# 5. Check only selected algorithms
+verifiler verify test.txt test.txt.vf -a sha256
+verifiler calculate test.txt -a md5,sha512
+```
+
+Full command reference: `verifiler help`.
+
 ## Features
 
 - **All popular algorithms**: MD5, SHA-1, SHA-256, SHA-512, SHA3-256, SHA3-512, BLAKE2b-512, BLAKE2s-256, BLAKE3, CRC32
@@ -14,24 +108,7 @@ VeriFiler computes checksums of any file with popular algorithms and writes a sm
 - **Console output**: results are always available in the terminal; `verify` prints `OK`/`FAIL` per algorithm and a clear final verdict
 - **Built-in help**: `verifiler help` explains every command, option, algorithm and exit code
 
-## Installation
-
-Requires only the Rust toolchain:
-
-```sh
-cargo build --release
-# binary: target/release/verifiler
-```
-
-Or install directly:
-
-```sh
-cargo install --path .
-```
-
 ## Usage
-
-Run `verifiler help` for the full reference:
 
 ```
 USAGE:
@@ -114,6 +191,8 @@ Measured on a 2 GB file (all 10 algorithms, single pass):
 ```sh
 cargo test --release    # 12 integration tests (roundtrip, corruption, CLI, selection)
 ```
+
+CI (`.github/workflows/build.yml`) runs the test suite on Linux, macOS and Windows, and builds release archives for 5 platforms on every push; tagging a release (`v*`) uploads the binaries to a draft GitHub Release.
 
 ## License
 
