@@ -5,85 +5,95 @@ mod algo;
 mod cli;
 mod manifest;
 
+use cli::Report;
 use manifest::ManifestEntry;
+use serde_json::json;
+
+fn diagnostic(message: &str) {
+    let _ = writeln!(io::stderr(), "verifiler: {message}");
+}
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let cmd = match cli::parse(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("verifiler: {e}");
-            eprintln!();
-            let _ = cli::print_usage(&mut std::io::stderr());
+            diagnostic(&e);
+            let _ = writeln!(io::stderr());
+            let _ = cli::print_usage(&mut io::stderr());
             std::process::exit(2);
         }
     };
-    let code = run(cmd);
-    std::process::exit(code);
+    std::process::exit(run(cmd));
 }
 
 fn run(cmd: cli::Command) -> i32 {
-    match cmd {
-        cli::Command::Help => match cli::print_usage(&mut io::stdout()) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("verifiler: cannot write stdout: {e}");
-                1
-            }
-        },
-        cli::Command::Version => {
-            match writeln!(io::stdout(), "verifiler {}", env!("CARGO_PKG_VERSION")) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("verifiler: cannot write stdout: {e}");
-                    1
-                }
-            }
-        }
+    let result = match cmd {
+        cli::Command::Help => cli::print_usage(&mut io::stdout())
+            .map(|()| true)
+            .map_err(|e| format!("cannot write stdout: {e}")),
+        cli::Command::Version => writeln!(io::stdout(), "verifiler {}", env!("CARGO_PKG_VERSION"))
+            .map(|()| true)
+            .map_err(|e| format!("cannot write stdout: {e}")),
         cli::Command::Calculate {
             file,
             output,
             algorithms,
-            quiet,
-        } => match calculate(&file, output.as_deref(), &algorithms, quiet) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("verifiler: {e}");
-                1
-            }
-        },
+            report,
+        } => calculate(&file, output.as_deref(), &algorithms, report).map(|()| true),
         cli::Command::Verify {
             file,
             manifest,
             algorithms,
-        } => match verify(&file, &manifest, &algorithms) {
-            Ok(true) => 0,
-            Ok(false) => 1,
-            Err(e) => {
-                eprintln!("verifiler: {e}");
-                1
-            }
-        },
+            report,
+        } => verify(&file, &manifest, &algorithms, report),
+        cli::Command::Check {
+            file,
+            algorithm,
+            hash,
+            report,
+        } => {
+            let expected = [ManifestEntry {
+                algorithm: algorithm.name().into(),
+                hash,
+            }];
+            verify_entries(&file, &expected, &[], report, "check")
+        }
+    };
+    match result {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(e) => {
+            diagnostic(&e);
+            1
+        }
     }
+}
+
+fn write_json(value: &serde_json::Value) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    serde_json::to_writer(&mut out, value).map_err(|e| format!("cannot write stdout: {e}"))?;
+    writeln!(out)
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("cannot write stdout: {e}"))
 }
 
 fn calculate(
     file: &Path,
     output: Option<&Path>,
     algorithms: &[algo::Algorithm],
-    quiet: bool,
+    report: Report,
 ) -> Result<(), String> {
     if let Some(path) = output {
         manifest::check_output(file, path)?;
     }
-
-    let selected: Vec<algo::Algorithm> = if algorithms.is_empty() {
-        algo::ALL.to_vec()
+    let selected = if algorithms.is_empty() {
+        algo::ALL
     } else {
-        algorithms.to_vec()
+        algorithms
     };
-
-    let hashes = algo::digest_file_hex(file, &selected)?;
+    let hashes = algo::digest_file_hex(file, selected)?;
     let entries: Vec<_> = selected
         .iter()
         .zip(hashes)
@@ -92,98 +102,124 @@ fn calculate(
             hash,
         })
         .collect();
-
     if let Some(path) = output {
         manifest::write_manifest(file, path, &entries)
             .map_err(|e| format!("cannot write '{}': {e}", path.display()))?;
     }
-    if output.is_none() || !quiet {
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::new(stdout.lock());
-        for e in &entries {
-            writeln!(out, "{} {}", e.algorithm, e.hash)
-                .map_err(|e| format!("cannot write stdout: {e}"))?;
+    match report {
+        Report::Json => write_json(
+            &json!({"operation": "calculate", "checksums": entries.iter()
+            .map(|e| json!({"algorithm": e.algorithm, "digest": e.hash})).collect::<Vec<_>>() }),
+        ),
+        Report::Quiet if output.is_some() => Ok(()),
+        _ => {
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::new(stdout.lock());
+            for e in &entries {
+                writeln!(out, "{} {}", e.algorithm, e.hash)
+                    .map_err(|e| format!("cannot write stdout: {e}"))?;
+            }
+            out.flush().map_err(|e| format!("cannot write stdout: {e}"))
         }
-        out.flush()
-            .map_err(|e| format!("cannot write stdout: {e}"))?;
     }
-    Ok(())
 }
 
-fn verify(file: &Path, manifest_path: &Path, only: &[algo::Algorithm]) -> Result<bool, String> {
-    let manifest_name = manifest_path.display();
+fn verify(
+    file: &Path,
+    manifest_path: &Path,
+    only: &[algo::Algorithm],
+    report: Report,
+) -> Result<bool, String> {
     let expected = manifest::parse_manifest(manifest_path)
-        .map_err(|e| format!("cannot read manifest '{manifest_name}': {e}"))?;
+        .map_err(|e| format!("cannot read manifest '{}': {e}", manifest_path.display()))?;
     if expected.is_empty() {
-        return Err(format!("manifest '{manifest_name}' contains no checksums"));
+        return Err(format!(
+            "manifest '{}' contains no checksums",
+            manifest_path.display()
+        ));
     }
+    verify_entries(file, &expected, only, report, "verify")
+}
 
-    let selected: Vec<&manifest::ManifestEntry> = if only.is_empty() {
+fn verify_entries(
+    file: &Path,
+    expected: &[ManifestEntry],
+    only: &[algo::Algorithm],
+    report: Report,
+    operation: &str,
+) -> Result<bool, String> {
+    let selected: Vec<_> = if only.is_empty() {
         expected.iter().collect()
     } else {
-        let mut picked = Vec::with_capacity(only.len());
-        for algo in only {
-            let name = algo.name();
-            let found = expected
-                .iter()
-                .find(|e| e.algorithm == name)
-                .ok_or_else(|| format!("manifest '{manifest_name}' has no '{name}' checksum"))?;
-            picked.push(found);
-        }
-        picked
+        only.iter()
+            .map(|a| {
+                expected
+                    .iter()
+                    .find(|e| e.algorithm == a.name())
+                    .ok_or_else(|| format!("manifest has no '{}' checksum", a.name()))
+            })
+            .collect::<Result<_, _>>()?
     };
-
-    let algorithms: Vec<algo::Algorithm> = selected
+    let algorithms = selected
         .iter()
         .map(|e| algo::Algorithm::from_name(&e.algorithm))
         .collect::<Result<Vec<_>, _>>()?;
-
-    let actual_hashes = algo::digest_file_hex(file, &algorithms)?;
-
-    let mut ok_count = 0usize;
-    let mut all_ok = true;
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    let stderr = io::stderr();
-    let mut err = io::BufWriter::new(stderr.lock());
-
-    for (entry, actual) in selected.iter().zip(actual_hashes) {
-        let entry = *entry;
-        if actual.eq_ignore_ascii_case(&entry.hash) {
-            ok_count += 1;
-            writeln!(out, "OK       {} {}", entry.algorithm, actual)
+    let actual = algo::digest_file_hex(file, &algorithms)?;
+    let matched = selected
+        .iter()
+        .zip(&actual)
+        .filter(|(e, a)| e.hash.eq_ignore_ascii_case(a))
+        .count();
+    let all_ok = matched == selected.len();
+    match report {
+        Report::Quiet => {}
+        Report::Json => write_json(&json!({
+            "operation": operation, "intact": all_ok, "matched": matched, "total": selected.len(),
+            "checksums": selected.iter().zip(&actual).map(|(e, a)| json!({
+                "algorithm": e.algorithm, "expected": e.hash, "actual": a,
+                "matched": e.hash.eq_ignore_ascii_case(a)
+            })).collect::<Vec<_>>()
+        }))?,
+        Report::Text => {
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::new(stdout.lock());
+            let stderr = io::stderr();
+            let mut err = io::BufWriter::new(stderr.lock());
+            for (entry, actual) in selected.iter().zip(&actual) {
+                if actual.eq_ignore_ascii_case(&entry.hash) {
+                    writeln!(out, "OK       {} {}", entry.algorithm, actual)
+                        .map_err(|e| format!("cannot write stdout: {e}"))?;
+                } else {
+                    writeln!(
+                        err,
+                        "FAIL     {} expected={} actual={}",
+                        entry.algorithm, entry.hash, actual
+                    )
+                    .map_err(|e| format!("cannot write stderr: {e}"))?;
+                }
+            }
+            if all_ok {
+                writeln!(
+                    out,
+                    "{}/{} checksums matched: file is intact",
+                    matched,
+                    selected.len()
+                )
                 .map_err(|e| format!("cannot write stdout: {e}"))?;
-        } else {
-            all_ok = false;
-            writeln!(
-                err,
-                "FAIL     {} expected={} actual={}",
-                entry.algorithm, entry.hash, actual
-            )
-            .map_err(|e| format!("cannot write stderr: {e}"))?;
+            } else {
+                writeln!(
+                    err,
+                    "{}/{} checksums matched: file is CORRUPTED",
+                    matched,
+                    selected.len()
+                )
+                .map_err(|e| format!("cannot write stderr: {e}"))?;
+            }
+            out.flush()
+                .map_err(|e| format!("cannot write stdout: {e}"))?;
+            err.flush()
+                .map_err(|e| format!("cannot write stderr: {e}"))?;
         }
     }
-
-    if all_ok {
-        writeln!(
-            out,
-            "{}/{} checksums matched: file is intact",
-            ok_count,
-            selected.len()
-        )
-        .map_err(|e| format!("cannot write stdout: {e}"))?;
-    } else {
-        writeln!(
-            err,
-            "{}/{} checksums matched: file is CORRUPTED",
-            ok_count,
-            selected.len()
-        )
-        .map_err(|e| format!("cannot write stderr: {e}"))?;
-    }
-    out.flush()
-        .map_err(|e| format!("cannot write stdout: {e}"))?;
-    err.flush()
-        .map_err(|e| format!("cannot write stderr: {e}"))?;
     Ok(all_ok)
 }
