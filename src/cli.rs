@@ -1,123 +1,269 @@
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::algo::{self, Algorithm};
+
+#[derive(Copy, Clone)]
+pub enum Report {
+    Text,
+    Quiet,
+    Json,
+}
 
 pub enum Command {
     Help,
     Version,
     Calculate {
-        file: String,
-        output: Option<String>,
+        file: PathBuf,
+        output: Option<PathBuf>,
         algorithms: Vec<Algorithm>,
-        quiet: bool,
+        report: Report,
     },
     Verify {
-        file: String,
-        manifest: String,
+        file: PathBuf,
+        manifest: PathBuf,
+        algorithms: Vec<Algorithm>,
+        report: Report,
+    },
+    Check {
+        file: PathBuf,
+        algorithm: Algorithm,
+        hash: String,
+        report: Report,
     },
 }
 
-pub fn print_usage<W: Write>(w: &mut W) {
-    let _ = writeln!(
+pub fn print_usage<W: Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(
         w,
         "verifiler {} - portable file checksum calculator/verifier
 
 USAGE:
-    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO[,ALGO...]>] [-q]
-    verifiler verify <FILE> <MANIFEST>
-    verifiler help | version
+    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler check <FILE> <ALGO> <DIGEST> [--json | -q]
+    verifiler help
+    verifiler version
 
 COMMANDS:
-    calculate    Compute checksums of FILE with all popular algorithms
-                 (or a selected subset) and write them to MANIFEST,
-                 or to stdout if -o is not given.
+    calculate    Compute checksums of FILE and write them to MANIFEST,
+                 or to stdout if -o is not given. Without -a all supported
+                 algorithms are computed.
     verify       Check FILE against the checksums in MANIFEST and report
-                 whether the file is intact.
+                 whether the file is intact. Without -a every checksum
+                 found in the manifest is checked; with -a only the listed
+                 algorithms are checked (they must exist in the manifest).
+    check        Verify FILE against one expected hexadecimal digest,
+                 without creating a manifest first.
+    help         Show this help.
+    version      Show version.
 
-OPTIONS (calculate):
-    -o, --output <PATH>    Manifest file to write (default: stdout)
-    -a, --algos <LIST>     Comma-separated algorithms to use
-                           (default: all). Supported: {algs}
-    -q, --quiet            Do not print checksums to the console
-                           when writing a manifest file
+OPTIONS:
+    -h, --help             Show command help
+    --                     End options (allows filenames starting with '-')
+    -o, --output <PATH>    (calculate) Manifest file to write; - means stdout
+    -a, --algos <LIST>     (calculate/verify) Comma-separated names; may repeat
+                           (e.g. -a md5,sha256 -a blake3). Default: all.
+                           Supported: {algs}
+    -q, --quiet            Suppress calculate output when writing a manifest;
+                           verify/check produce no output except runtime errors
+    --json                Print structured results on stdout (excludes -q)
+    FILE = -              Read file data from stdin; use ./- for a file named -
 
 OUTPUT:
     calculate writes lines of '<algorithm> <hex_digest>', e.g.:
         sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-    verify prints 'OK <algo> <digest>' or 'FAIL <algo> expected=<e> actual=<a>'
-    and exits 0 if the file is intact, 1 if corrupted, 2 on usage errors.
+    verify prints one line per checked algorithm:
+        OK       <algorithm> <digest>
+        FAIL     <algorithm> expected=<expected> actual=<actual>
+    followed by a summary. Exit codes:
+        0  success (file intact)
+        1  verification failed (corrupted file) or runtime error
+        2  usage error
 
-The manifest is a simple text file: one '<algorithm> <digest>' pair per line,
-so it can be transferred alongside the downloaded file and fed back to
-'verify' on any machine.",
+MANIFEST:
+    A plain text file, one '<algorithm> <digest>' pair per line:
+        md5 e5c9b7be5d42cb48a7c2df30c5a305d8
+        sha256 e9dacdd20ce34559da69c69bc9ac0258b8433622953fa59a68642324baa77606
+    Blank lines and lines starting with '#' are ignored. The manifest can be
+    edited manually, transferred alongside the file, and fed back to 'verify'
+    on any machine.
+
+EXAMPLES:
+    verifiler calculate myfile.iso                          all algos to stdout
+    verifiler calculate myfile.iso -o my.vf                 all algos to manifest
+    verifiler calculate myfile.iso -o my.vf -a md5,sha256   only md5 and sha256
+    verifiler verify myfile.iso my.vf                       check everything
+    verifiler verify myfile.iso my.vf -a sha256             check only sha256
+    verifiler verify myfile.iso my.vf -a md5,blake3         check md5 and blake3
+    verifiler calculate - -a sha256                       hash stdin
+    verifiler verify myfile.iso my.vf --json               structured result
+    verifiler check myfile.iso sha256 EXPECTED_DIGEST      direct checksum check",
         env!("CARGO_PKG_VERSION"),
         algs = algo::supported_names()
-    );
+    )
 }
 
-pub fn parse(args: &[String]) -> Result<Command, String> {
-    let mut it = args.iter();
-    let Some(cmd) = it.next() else {
+pub fn parse(args: &[OsString]) -> Result<Command, String> {
+    let Some(cmd) = args.first() else {
         return Ok(Command::Help);
     };
-
-    match cmd.as_str() {
-        "help" | "--help" | "-h" => Ok(Command::Help),
-        "version" | "--version" | "-V" => Ok(Command::Version),
-        "calculate" => {
-            let mut file: Option<String> = None;
-            let mut output: Option<String> = None;
-            let mut algorithms: Vec<Algorithm> = Vec::new();
-            let mut quiet = false;
-            let rest: Vec<String> = it.cloned().collect();
-            let mut i = 0;
-            while i < rest.len() {
-                let a = &rest[i];
-                match a.as_str() {
-                    "-o" | "--output" => {
-                        i += 1;
-                        output = Some(
-                            rest.get(i)
-                                .ok_or_else(|| "missing value for -o/--output".to_string())?
-                                .clone(),
-                        );
-                    }
-                    "-a" | "--algos" => {
-                        i += 1;
-                        let list = rest
-                            .get(i)
-                            .ok_or_else(|| "missing value for -a/--algos".to_string())?;
-                        algorithms = parse_algo_list(list)?;
-                    }
-                    "-q" | "--quiet" => quiet = true,
-                    _ => {
-                        if file.is_some() {
-                            return Err(format!("unexpected argument '{a}'"));
-                        }
-                        file = Some(a.clone());
-                    }
-                }
-                i += 1;
+    let cmd = cmd.to_str().ok_or("command must be UTF-8")?;
+    match cmd {
+        "help" | "--help" | "-h" | "version" | "--version" | "-V" => {
+            if args.len() != 1 {
+                return Err("unexpected arguments".into());
             }
-            let file = file.ok_or_else(|| "calculate requires a FILE argument".to_string())?;
-            Ok(Command::Calculate { file, output, algorithms, quiet })
+            return Ok(if matches!(cmd, "help" | "--help" | "-h") {
+                Command::Help
+            } else {
+                Command::Version
+            });
         }
-        "verify" => {
-            let rest: Vec<String> = it.cloned().collect();
-            if rest.len() != 2 {
-                return Err("verify requires exactly two arguments: FILE MANIFEST".to_string());
-            }
-            Ok(Command::Verify { file: rest[0].clone(), manifest: rest[1].clone() })
-        }
-        other => Err(format!("unknown command '{other}'")),
+        "calculate" | "verify" | "check" => {}
+        other => return Err(format!("unknown command '{other}'")),
     }
+    let mut files = Vec::new();
+    let mut output = None;
+    let mut output_given = false;
+    let mut algorithms = Vec::new();
+    let mut quiet = false;
+    let mut json = false;
+    let mut positional = false;
+    let mut it = args[1..].iter();
+    while let Some(arg) = it.next() {
+        if !positional {
+            match arg.to_str() {
+                Some("--") => {
+                    positional = true;
+                    continue;
+                }
+                Some("--help" | "-h") => return Ok(Command::Help),
+                Some("-o" | "--output") if cmd == "calculate" => {
+                    if output_given {
+                        return Err("output specified more than once".into());
+                    }
+                    output_given = true;
+                    let path = value(&mut it, "-o/--output")?;
+                    output = (path != "-").then(|| PathBuf::from(path));
+                    continue;
+                }
+                Some("-a" | "--algos") if cmd != "check" => {
+                    let list = value(&mut it, "-a/--algos")?
+                        .to_str()
+                        .ok_or("algorithm names must be UTF-8")?;
+                    algorithms = merge(algorithms, parse_algo_list(list)?);
+                    continue;
+                }
+                Some(a) if a.starts_with("--algos=") && cmd != "check" => {
+                    algorithms = merge(algorithms, parse_algo_list(&a[8..])?);
+                    continue;
+                }
+                Some(a) if a.starts_with("--output=") && cmd == "calculate" => {
+                    if output_given {
+                        return Err("output specified more than once".into());
+                    }
+                    let path = &a[9..];
+                    if path.is_empty() {
+                        return Err("missing value for --output".into());
+                    }
+                    output_given = true;
+                    output = (path != "-").then(|| PathBuf::from(path));
+                    continue;
+                }
+                Some("--json") => {
+                    json = true;
+                    continue;
+                }
+                Some("-") => {
+                    files.push(PathBuf::from(arg));
+                    continue;
+                }
+                Some("-q" | "--quiet") => {
+                    quiet = true;
+                    continue;
+                }
+                _ if arg.to_string_lossy().starts_with('-') => {
+                    return Err(format!("unknown option '{}'", arg.to_string_lossy()));
+                }
+                _ => {}
+            }
+        }
+        files.push(PathBuf::from(arg));
+    }
+    if quiet && json {
+        return Err("--quiet and --json cannot be combined".into());
+    }
+    let report = if json {
+        Report::Json
+    } else if quiet {
+        Report::Quiet
+    } else {
+        Report::Text
+    };
+    if cmd == "calculate" {
+        if files.len() != 1 {
+            return Err("calculate requires exactly one FILE argument".into());
+        }
+        Ok(Command::Calculate {
+            file: files.remove(0),
+            output,
+            algorithms,
+            report,
+        })
+    } else if cmd == "verify" {
+        if files.len() != 2 {
+            return Err("verify requires exactly two arguments: FILE MANIFEST".into());
+        }
+        Ok(Command::Verify {
+            file: files.remove(0),
+            manifest: files.remove(0),
+            algorithms,
+            report,
+        })
+    } else {
+        if files.len() != 3 {
+            return Err("check requires exactly three arguments: FILE ALGO DIGEST".into());
+        }
+        let algorithm =
+            Algorithm::from_name(files[1].to_str().ok_or("algorithm name must be UTF-8")?)?;
+        let hash = algorithm.validate_hash(files[2].to_str().ok_or("digest must be UTF-8")?)?;
+        Ok(Command::Check {
+            file: files.remove(0),
+            algorithm,
+            hash,
+            report,
+        })
+    }
+}
+
+fn value<'a>(it: &mut std::slice::Iter<'a, OsString>, option: &str) -> Result<&'a OsStr, String> {
+    let value = it
+        .next()
+        .ok_or_else(|| format!("missing value for {option}"))?;
+    if value.is_empty() || (value != "-" && value.to_string_lossy().starts_with('-')) {
+        return Err(format!(
+            "missing value for {option}; use './' for paths starting with '-'"
+        ));
+    }
+    Ok(value)
+}
+
+fn merge(mut algos: Vec<Algorithm>, more: Vec<Algorithm>) -> Vec<Algorithm> {
+    for a in more {
+        if !algos.contains(&a) {
+            algos.push(a);
+        }
+    }
+    algos
 }
 
 fn parse_algo_list(list: &str) -> Result<Vec<Algorithm>, String> {
     let mut algos = Vec::new();
     for name in list.split(',') {
         if name.trim().is_empty() {
-            continue;
+            return Err(format!("empty algorithm name in '{list}'"));
         }
         let a = Algorithm::from_name(name)?;
         if !algos.contains(&a) {
