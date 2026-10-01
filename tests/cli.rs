@@ -611,6 +611,8 @@ fn output_write_failures_are_runtime_errors() {
     for args in [
         vec!["calculate"],
         vec!["verify"],
+        vec!["calculate", "--json"],
+        vec!["verify", "--json"],
         vec!["help"],
         vec!["version"],
     ] {
@@ -679,4 +681,273 @@ fn unicode_paths_roundtrip() {
         .arg(manifest.path())
         .assert()
         .success();
+}
+
+#[test]
+fn stdin_calculate_and_verify_binary_data() {
+    let expected = include_str!("vectors/abc.vf");
+    bin()
+        .args(["calculate", "-"])
+        .write_stdin(b"abc".to_vec())
+        .assert()
+        .success()
+        .stdout(expected);
+    let dir = assert_fs::TempDir::new().unwrap();
+    let manifest = dir.child("stdin.vf");
+    bin()
+        .args(["calculate", "-", "-o"])
+        .arg(manifest.path())
+        .arg("-q")
+        .write_stdin(b"abc".to_vec())
+        .assert()
+        .success()
+        .stdout("");
+    bin()
+        .args(["verify", "-"])
+        .arg(manifest.path())
+        .write_stdin(b"abc".to_vec())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("10/10 checksums matched"));
+    bin()
+        .args(["verify", "-"])
+        .arg(manifest.path())
+        .write_stdin(b"wrong".to_vec())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("CORRUPTED"));
+    let mut bytes = (0..=255u8).cycle().take(256 * 4096).collect::<Vec<_>>();
+    bytes.extend_from_slice(&[0, 255, 128]);
+    manifest
+        .write_str(include_str!("vectors/multichunk.vf"))
+        .unwrap();
+    bin()
+        .args(["verify", "-"])
+        .arg(manifest.path())
+        .write_stdin(bytes)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("9/9 checksums matched"));
+}
+
+#[test]
+fn redirected_stdin_source_is_not_overwritten() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("input.bin");
+    data.write_binary(b"keep these bytes").unwrap();
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("verifiler"))
+        .args(["calculate", "-", "-o"])
+        .arg(data.path())
+        .stdin(std::fs::File::open(data.path()).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to overwrite"));
+    assert_eq!(std::fs::read(data.path()).unwrap(), b"keep these bytes");
+}
+
+#[test]
+fn stdin_empty_input_and_literal_dash_filename() {
+    bin()
+        .args(["calculate", "-", "-a", "md5"])
+        .write_stdin(Vec::new())
+        .assert()
+        .success()
+        .stdout("md5 d41d8cd98f00b204e9800998ecf8427e\n");
+    let dir = assert_fs::TempDir::new().unwrap();
+    dir.child("-").write_binary(b"abc").unwrap();
+    bin()
+        .current_dir(dir.path())
+        .args(["calculate", "./-", "-a", "md5", "-o", "-"])
+        .assert()
+        .success()
+        .stdout("md5 900150983cd24fb0d6963f7d28e17f72\n");
+    assert_eq!(std::fs::read(dir.child("-").path()).unwrap(), b"abc");
+}
+
+#[test]
+fn direct_check_matches_or_reports_corruption() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("abc.bin");
+    data.write_binary(b"abc").unwrap();
+    for line in include_str!("vectors/abc.vf").lines() {
+        let (algo, hash) = line.split_once(' ').unwrap();
+        bin()
+            .arg("check")
+            .arg(data.path())
+            .arg(algo)
+            .arg(hash.to_uppercase())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1/1 checksums matched"));
+    }
+    bin()
+        .arg("check")
+        .arg(data.path())
+        .args(["md5", "00000000000000000000000000000000"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("CORRUPTED"));
+    bin()
+        .args(["check", "-", "md5", "900150983cd24fb0d6963f7d28e17f72"])
+        .write_stdin(b"abc".to_vec())
+        .assert()
+        .success();
+    for args in [
+        vec!["check", "file"],
+        vec!["check", "file", "md5", "bad"],
+        vec!["check", "file", "unknown", "abcd"],
+        vec![
+            "check",
+            "file",
+            "md5",
+            "900150983cd24fb0d6963f7d28e17f72",
+            "-a",
+            "md5",
+        ],
+    ] {
+        bin().args(args).assert().code(2);
+    }
+}
+
+#[test]
+fn json_calculate_and_verify_are_machine_readable() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("abc.bin");
+    let manifest = dir.child("out.vf");
+    data.write_binary(b"abc").unwrap();
+    let result = bin()
+        .arg("calculate")
+        .arg(data.path())
+        .arg("-o")
+        .arg(manifest.path())
+        .args(["-a", "md5,sha256", "--json"])
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    assert_eq!(value["operation"], "calculate");
+    assert_eq!(value["checksums"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["checksums"][0]["digest"],
+        "900150983cd24fb0d6963f7d28e17f72"
+    );
+    let text = std::fs::read_to_string(manifest.path()).unwrap();
+    assert!(text.starts_with("md5 "), "manifest remains plain text");
+    for (payload, expected_code, intact) in [
+        (b"abc".as_slice(), 0, true),
+        (b"wrong".as_slice(), 1, false),
+    ] {
+        let result = bin()
+            .args(["verify", "-"])
+            .arg(manifest.path())
+            .arg("--json")
+            .write_stdin(payload.to_vec())
+            .assert()
+            .code(expected_code)
+            .stderr("");
+        let value: serde_json::Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+        assert_eq!(value["operation"], "verify");
+        assert_eq!(value["intact"], intact);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["matched"], if intact { 2 } else { 0 });
+        assert_eq!(value["checksums"][0]["matched"], intact);
+        assert_eq!(
+            value["checksums"][0]["expected"],
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+    let result = bin()
+        .arg("check")
+        .arg(data.path())
+        .args(["md5", "900150983cd24fb0d6963f7d28e17f72", "--json"])
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    assert_eq!(value["operation"], "check");
+    assert_eq!(value["intact"], true);
+    assert_eq!(value["total"], 1);
+}
+
+#[test]
+fn quiet_verification_uses_exit_status_and_keeps_runtime_errors() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("abc.bin");
+    let manifest = dir.child("out.vf");
+    data.write_binary(b"abc").unwrap();
+    manifest
+        .write_str("md5 900150983cd24fb0d6963f7d28e17f72\n")
+        .unwrap();
+    bin()
+        .arg("verify")
+        .arg(data.path())
+        .arg(manifest.path())
+        .arg("-q")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    data.write_binary(b"wrong").unwrap();
+    bin()
+        .arg("verify")
+        .arg(data.path())
+        .arg(manifest.path())
+        .arg("-q")
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr("");
+    bin()
+        .arg("check")
+        .arg(data.path())
+        .args(["md5", "900150983cd24fb0d6963f7d28e17f72", "-q"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr("");
+    bin()
+        .arg("verify")
+        .arg(dir.child("missing").path())
+        .arg(manifest.path())
+        .arg("-q")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot access"));
+    for args in [
+        vec!["calculate", "file", "--json", "-q"],
+        vec!["verify", "file", "manifest", "--json", "-q"],
+    ] {
+        bin().args(args).assert().code(2);
+    }
+}
+
+#[test]
+fn equals_options_and_algorithm_deduplication() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    dir.child("data.bin").write_binary(b"abc").unwrap();
+    bin()
+        .current_dir(dir.path())
+        .args([
+            "calculate",
+            "data.bin",
+            "--output=-sum.vf",
+            "--algos=MD5,md5",
+            "-a",
+            "Md5",
+        ])
+        .assert()
+        .success()
+        .stdout("md5 900150983cd24fb0d6963f7d28e17f72\n");
+    bin()
+        .current_dir(dir.path())
+        .args(["verify", "--algos=md5", "--", "data.bin", "-sum.vf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1/1 checksums matched"));
+    for args in [
+        vec!["calculate", "data.bin", "--output="],
+        vec!["calculate", "data.bin", "--algos="],
+        vec!["calculate", "data.bin", "-o", "-", "--output=other"],
+    ] {
+        bin().args(args).assert().code(2);
+    }
 }

@@ -64,24 +64,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test native binary
+        if: (runner.arch == 'ARM64' && startsWith(matrix.target, 'aarch64-')) || (runner.arch == 'X64' && startsWith(matrix.target, 'x86_64-'))
+        run: cargo run --release --locked --target ${{ matrix.target }} -- --version
       - name: Archive (unix)
         if: matrix.os != 'windows-latest'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/verifiler dist/
-          cp README.md dist/
-          tar -czf "verifiler-$ARCHIVE_VERSION-${{ matrix.archive }}" -C dist verifiler README.md
+          cp README.md LICENSE dist/
+          archive_version=${ARCHIVE_VERSION//[^a-zA-Z0-9._-]/_}
+          archive_path="verifiler-$archive_version-${{ matrix.archive }}"
+          tar -czf "$archive_path" -C dist verifiler README.md LICENSE
+          digest=$(shasum -a 256 "$archive_path" | cut -d ' ' -f 1)
+          printf 'sha256 %s\n' "$digest" > "$archive_path.vf"
       - name: Archive (windows)
         if: matrix.os == 'windows-latest'
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/verifiler.exe dist/
           cp README.md dist/
-          Compress-Archive -Path dist/verifiler.exe, README.md -DestinationPath "verifiler-$env:ARCHIVE_VERSION-${{ matrix.archive }}"
+          cp LICENSE dist/
+          $archiveVersion = $env:ARCHIVE_VERSION -replace '[^a-zA-Z0-9._-]', '_'
+          $archivePath = "verifiler-$archiveVersion-${{ matrix.archive }}"
+          Compress-Archive -Path dist/verifiler.exe, dist/README.md, dist/LICENSE -DestinationPath $archivePath
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$archivePath.vf" -Value "sha256 $digest" -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: verifiler-*-${{ matrix.archive }}
+          path: |
+            verifiler-*-${{ matrix.archive }}
+            verifiler-*-${{ matrix.archive }}.vf
 
   release:
     name: Upload release binaries

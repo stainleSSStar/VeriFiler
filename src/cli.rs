@@ -4,6 +4,13 @@ use std::path::PathBuf;
 
 use crate::algo::{self, Algorithm};
 
+#[derive(Copy, Clone)]
+pub enum Report {
+    Text,
+    Quiet,
+    Json,
+}
+
 pub enum Command {
     Help,
     Version,
@@ -11,12 +18,19 @@ pub enum Command {
         file: PathBuf,
         output: Option<PathBuf>,
         algorithms: Vec<Algorithm>,
-        quiet: bool,
+        report: Report,
     },
     Verify {
         file: PathBuf,
         manifest: PathBuf,
         algorithms: Vec<Algorithm>,
+        report: Report,
+    },
+    Check {
+        file: PathBuf,
+        algorithm: Algorithm,
+        hash: String,
+        report: Report,
     },
 }
 
@@ -26,8 +40,9 @@ pub fn print_usage<W: Write>(w: &mut W) -> std::io::Result<()> {
         "verifiler {} - portable file checksum calculator/verifier
 
 USAGE:
-    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [-q]
-    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]]
+    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler check <FILE> <ALGO> <DIGEST> [--json | -q]
     verifiler help
     verifiler version
 
@@ -39,18 +54,22 @@ COMMANDS:
                  whether the file is intact. Without -a every checksum
                  found in the manifest is checked; with -a only the listed
                  algorithms are checked (they must exist in the manifest).
+    check        Verify FILE against one expected hexadecimal digest,
+                 without creating a manifest first.
     help         Show this help.
     version      Show version.
 
 OPTIONS:
     -h, --help             Show command help
     --                     End options (allows filenames starting with '-')
-    -o, --output <PATH>    (calculate) Manifest file to write (default: stdout)
-    -a, --algos <LIST>     Comma-separated algorithm names; may be repeated
+    -o, --output <PATH>    (calculate) Manifest file to write; - means stdout
+    -a, --algos <LIST>     (calculate/verify) Comma-separated names; may repeat
                            (e.g. -a md5,sha256 -a blake3). Default: all.
                            Supported: {algs}
-    -q, --quiet            (calculate) Do not print checksums to the console
-                           when writing a manifest file
+    -q, --quiet            Suppress calculate output when writing a manifest;
+                           verify/check produce no output except runtime errors
+    --json                Print structured results on stdout (excludes -q)
+    FILE = -              Read file data from stdin; use ./- for a file named -
 
 OUTPUT:
     calculate writes lines of '<algorithm> <hex_digest>', e.g.:
@@ -77,7 +96,10 @@ EXAMPLES:
     verifiler calculate myfile.iso -o my.vf -a md5,sha256   only md5 and sha256
     verifiler verify myfile.iso my.vf                       check everything
     verifiler verify myfile.iso my.vf -a sha256             check only sha256
-    verifiler verify myfile.iso my.vf -a md5,blake3         check md5 and blake3",
+    verifiler verify myfile.iso my.vf -a md5,blake3         check md5 and blake3
+    verifiler calculate - -a sha256                       hash stdin
+    verifiler verify myfile.iso my.vf --json               structured result
+    verifiler check myfile.iso sha256 EXPECTED_DIGEST      direct checksum check",
         env!("CARGO_PKG_VERSION"),
         algs = algo::supported_names()
     )
@@ -99,13 +121,15 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
                 Command::Version
             });
         }
-        "calculate" | "verify" => {}
+        "calculate" | "verify" | "check" => {}
         other => return Err(format!("unknown command '{other}'")),
     }
     let mut files = Vec::new();
     let mut output = None;
+    let mut output_given = false;
     let mut algorithms = Vec::new();
     let mut quiet = false;
+    let mut json = false;
     let mut positional = false;
     let mut it = args[1..].iter();
     while let Some(arg) = it.next() {
@@ -117,20 +141,46 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
                 }
                 Some("--help" | "-h") => return Ok(Command::Help),
                 Some("-o" | "--output") if cmd == "calculate" => {
-                    if output.is_some() {
+                    if output_given {
                         return Err("output specified more than once".into());
                     }
-                    output = Some(PathBuf::from(value(&mut it, "-o/--output")?));
+                    output_given = true;
+                    let path = value(&mut it, "-o/--output")?;
+                    output = (path != "-").then(|| PathBuf::from(path));
                     continue;
                 }
-                Some("-a" | "--algos") => {
+                Some("-a" | "--algos") if cmd != "check" => {
                     let list = value(&mut it, "-a/--algos")?
                         .to_str()
                         .ok_or("algorithm names must be UTF-8")?;
                     algorithms = merge(algorithms, parse_algo_list(list)?);
                     continue;
                 }
-                Some("-q" | "--quiet") if cmd == "calculate" => {
+                Some(a) if a.starts_with("--algos=") && cmd != "check" => {
+                    algorithms = merge(algorithms, parse_algo_list(&a[8..])?);
+                    continue;
+                }
+                Some(a) if a.starts_with("--output=") && cmd == "calculate" => {
+                    if output_given {
+                        return Err("output specified more than once".into());
+                    }
+                    let path = &a[9..];
+                    if path.is_empty() {
+                        return Err("missing value for --output".into());
+                    }
+                    output_given = true;
+                    output = (path != "-").then(|| PathBuf::from(path));
+                    continue;
+                }
+                Some("--json") => {
+                    json = true;
+                    continue;
+                }
+                Some("-") => {
+                    files.push(PathBuf::from(arg));
+                    continue;
+                }
+                Some("-q" | "--quiet") => {
                     quiet = true;
                     continue;
                 }
@@ -142,6 +192,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
         }
         files.push(PathBuf::from(arg));
     }
+    if quiet && json {
+        return Err("--quiet and --json cannot be combined".into());
+    }
+    let report = if json {
+        Report::Json
+    } else if quiet {
+        Report::Quiet
+    } else {
+        Report::Text
+    };
     if cmd == "calculate" {
         if files.len() != 1 {
             return Err("calculate requires exactly one FILE argument".into());
@@ -150,9 +210,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
             file: files.remove(0),
             output,
             algorithms,
-            quiet,
+            report,
         })
-    } else {
+    } else if cmd == "verify" {
         if files.len() != 2 {
             return Err("verify requires exactly two arguments: FILE MANIFEST".into());
         }
@@ -160,6 +220,20 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
             file: files.remove(0),
             manifest: files.remove(0),
             algorithms,
+            report,
+        })
+    } else {
+        if files.len() != 3 {
+            return Err("check requires exactly three arguments: FILE ALGO DIGEST".into());
+        }
+        let algorithm =
+            Algorithm::from_name(files[1].to_str().ok_or("algorithm name must be UTF-8")?)?;
+        let hash = algorithm.validate_hash(files[2].to_str().ok_or("digest must be UTF-8")?)?;
+        Ok(Command::Check {
+            file: files.remove(0),
+            algorithm,
+            hash,
+            report,
         })
     }
 }
@@ -168,7 +242,7 @@ fn value<'a>(it: &mut std::slice::Iter<'a, OsString>, option: &str) -> Result<&'
     let value = it
         .next()
         .ok_or_else(|| format!("missing value for {option}"))?;
-    if value.is_empty() || value.to_string_lossy().starts_with('-') {
+    if value.is_empty() || (value != "-" && value.to_string_lossy().starts_with('-')) {
         return Err(format!(
             "missing value for {option}; use './' for paths starting with '-'"
         ));

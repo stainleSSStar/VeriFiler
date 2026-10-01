@@ -34,7 +34,7 @@ Expand-Archive verifiler-*-windows-x64.zip
 .\verifiler.exe calculate README.md
 ```
 
-> Releases are attached to git tags (`v0.1.0`, …). Until the first tag exists, CI still produces binaries on every push — grab them from **Actions → latest run → Artifacts** (the `x86_64-unknown-linux-gnu` artifact contains the `tar.gz`). You need to be logged in to GitHub to download artifacts.
+> Releases are attached to git tags (`v0.2.0`, …). Until the first tag exists, CI still produces binaries on every push — grab them from **Actions → latest run → Artifacts** (the `x86_64-unknown-linux-gnu` artifact contains the `tar.gz`). You need to be logged in to GitHub to download artifacts.
 
 ### Option B — build from source
 
@@ -106,14 +106,17 @@ Full command reference: `verifiler help`.
 - **Fast**: all selected algorithms computed in one disk pass (both `calculate` and `verify`)
 - **Portable**: a single executable with no separately installed Rust runtime; builds use standard platform libraries (Linux binaries require a compatible glibc)
 - **Console output**: results are always available in the terminal; `verify` prints `OK`/`FAIL` per algorithm and a clear final verdict
+- **Script support**: `--json` structured results, `verify/check -q` for exit-status-only checks, and direct `check FILE ALGO DIGEST`
+- **Streams**: `FILE = -` hashes stdin, including binary data, with the same bounded-memory single-pass implementation
 - **Built-in help**: `verifiler help` explains every command, option, algorithm and exit code
 
 ## Usage
 
 ```
 USAGE:
-    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [-q]
-    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]]
+    verifiler calculate <FILE> [-o <MANIFEST>] [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler verify <FILE> <MANIFEST> [-a <ALGO>[,<ALGO>...]] [--json | -q]
+    verifiler check <FILE> <ALGO> <DIGEST> [--json | -q]
     verifiler help
     verifiler version
 ```
@@ -151,7 +154,53 @@ OK       sha256 e9dacdd20ce34559da69c69bc9ac0258b8433622953fa59a68642324baa77606
 2/2 checksums matched: file is intact
 ```
 
-Exit codes: `0` success, `1` checksum mismatch or runtime error, `2` usage error.
+Exit codes: `0` success, `1` checksum mismatch or runtime error, `2` usage error. These codes also apply to `check`, JSON output, and quiet verification.
+
+### Direct checksum checks, streams and scripts
+
+Verify a checksum copied from a download page without writing a manifest:
+
+```sh
+verifiler check myfile.iso sha256 EXPECTED_HEX_DIGEST
+```
+
+`EXPECTED_HEX_DIGEST` is the full hexadecimal digest, without an algorithm prefix. Uppercase hexadecimal digits are accepted. Wrong length/non-hexadecimal text is a usage error (exit 2); a valid digest that does not match returns exit 1.
+
+Use `-` as the **FILE** to read binary data from stdin:
+
+```sh
+cat myfile.iso | verifiler calculate - -a sha256,blake3 -o myfile.vf -q
+cat myfile.iso | verifiler verify - myfile.vf
+```
+
+A manifest supplied to `verify` remains a regular file. `-o -` writes the text manifest to stdout. Use `./-` for an actual file named `-`. The long options also accept `--algos=sha256,blake3` and `--output=checksums.vf`.
+
+For scripts:
+
+```sh
+verifiler calculate myfile.iso -a sha256 --json
+verifiler verify myfile.iso myfile.vf --json
+verifiler verify myfile.iso myfile.vf -q
+verifiler check myfile.iso sha256 EXPECTED_HEX_DIGEST -q
+```
+
+`--json` writes one JSON object and a newline to stdout. A checksum mismatch is reported in JSON on stdout and still returns exit 1. Runtime/usage errors go to stderr. `--json` and `-q` cannot be combined.
+
+Calculate output:
+
+```json
+{"operation":"calculate","checksums":[{"algorithm":"md5","digest":"900150983cd24fb0d6963f7d28e17f72"}]}
+```
+
+Verify/check output:
+
+```json
+{"operation":"verify","intact":true,"matched":1,"total":1,"checksums":[{"algorithm":"md5","expected":"900150983cd24fb0d6963f7d28e17f72","actual":"900150983cd24fb0d6963f7d28e17f72","matched":true}]}
+```
+
+`check` uses `"operation":"check"` with the same result fields. When `calculate --json -o FILE` is used, FILE remains a plain-text manifest; JSON goes only to stdout.
+
+Quiet verification produces no output for either a match or mismatch; scripts use the exit code. Runtime errors remain visible on stderr. For compatibility, `calculate -q` only suppresses console output when saving a manifest; without a manifest destination it still prints checksums.
 
 ### Supported algorithms
 
@@ -180,9 +229,9 @@ The manifest can be edited manually (e.g. keep only the algorithms you trust), t
 
 - All selected checksums, including CRC32, are computed during one read of the file.
 - Inputs and manifests must be regular files. Inputs may be symlinks to regular files.
-- The manifest output must differ from the input, including hard links. Output symlinks are rejected.
+- The manifest output must differ from the named input, including hard links. Redirected stdin files are also compared with existing output files when their identity is available. Output symlinks are rejected.
 - Manifest output is written and synced to a temporary file in the destination directory, then atomically replaces the destination. A failed write leaves the previous manifest intact.
-- Observable length or modification-time changes while hashing cause an error. This is a best-effort check; files should remain unchanged during calculation/verification.
+- Observable length/modification-time changes, removal, or replacement of a named input while hashing cause an error. This is a best-effort check; files should remain unchanged during calculation/verification. Stdin streams have no pathname snapshot.
 - Use `--` before positional filenames that start with `-`; for `-o`, use a path such as `./-manifest.vf`.
 - Native file paths are supported, including Unicode names and non-UTF-8 names on filesystems that allow them.
 
@@ -198,7 +247,13 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --release --locked
 ```
 
-CI (`.github/workflows/build.yml`) runs the test suite on Linux, macOS and Windows, and builds release archives for 5 platforms on every branch push and pull request; tagging a release (`v*`) uploads the binaries to a draft GitHub Release.
+CI (`.github/workflows/build.yml`) runs formatting, Clippy and tests on Linux, macOS and Windows, builds release archives for 5 platforms, and smoke-tests each native binary. Every archive includes README and the MIT license, and has an adjacent `.vf` SHA-256 manifest generated with a platform checksum tool. All archives/manifests are available in Actions artifacts; tagging a release (`v*`) uploads them to a draft GitHub Release.
+
+After unpacking a binary, verify its downloaded archive with the matching manifest, for example:
+
+```sh
+./verifiler verify verifiler-v0.2.0-macos-arm64.tar.gz verifiler-v0.2.0-macos-arm64.tar.gz.vf
+```
 
 ## License
 

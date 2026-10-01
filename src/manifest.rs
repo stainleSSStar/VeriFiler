@@ -13,8 +13,9 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<ManifestEntry>, String> {
     let mut reader = std::io::BufReader::new(file);
     let mut entries = Vec::new();
     let mut idx = 0;
+    let mut bytes = Vec::new();
     loop {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let n = reader
             .by_ref()
             .take(4097)
@@ -42,26 +43,14 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<ManifestEntry>, String> {
         let algorithm = fields.next().unwrap().to_ascii_lowercase();
         let hash = fields
             .next()
-            .ok_or_else(|| format!("line {idx}: expected '<algorithm> <digest>'"))?
-            .to_ascii_lowercase();
+            .ok_or_else(|| format!("line {idx}: expected '<algorithm> <digest>'"))?;
         if fields.next().is_some() {
             return Err(format!("line {idx}: expected exactly two fields"));
         }
         let algo = Algorithm::from_name(&algorithm).map_err(|e| format!("line {idx}: {e}"))?;
-        let length = match algo {
-            Algorithm::Md5 => 32,
-            Algorithm::Sha1 => 40,
-            Algorithm::Sha256 | Algorithm::Sha3_256 | Algorithm::Blake2s256 | Algorithm::Blake3 => {
-                64
-            }
-            Algorithm::Sha512 | Algorithm::Sha3_512 | Algorithm::Blake2b512 => 128,
-            Algorithm::Crc32 => 8,
-        };
-        if hash.len() != length || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "line {idx}: {algorithm} requires {length} hexadecimal digits"
-            ));
-        }
+        let hash = algo
+            .validate_hash(hash)
+            .map_err(|e| format!("line {idx}: {e}"))?;
         if entries
             .iter()
             .any(|e: &ManifestEntry| e.algorithm == algorithm)
@@ -74,10 +63,12 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<ManifestEntry>, String> {
 }
 
 pub fn check_output(input: &Path, output: &Path) -> Result<(), String> {
-    let input_meta = std::fs::metadata(input)
-        .map_err(|e| format!("cannot access '{}': {e}", input.display()))?;
-    if !input_meta.is_file() {
-        return Err(format!("'{}' is not a regular file", input.display()));
+    if input != Path::new("-") {
+        let input_meta = std::fs::metadata(input)
+            .map_err(|e| format!("cannot access '{}': {e}", input.display()))?;
+        if !input_meta.is_file() {
+            return Err(format!("'{}' is not a regular file", input.display()));
+        }
     }
     match std::fs::symlink_metadata(output) {
         Ok(meta) => {
@@ -87,7 +78,17 @@ pub fn check_output(input: &Path, output: &Path) -> Result<(), String> {
                     output.display()
                 ));
             }
-            if same_file::is_same_file(input, output).map_err(|e| e.to_string())? {
+            let same_input = if input == Path::new("-") {
+                match same_file::Handle::stdin() {
+                    Ok(source) => {
+                        source == same_file::Handle::from_path(output).map_err(|e| e.to_string())?
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                same_file::is_same_file(input, output).map_err(|e| e.to_string())?
+            };
+            if same_input {
                 return Err("manifest output is the input file; refusing to overwrite it".into());
             }
         }
