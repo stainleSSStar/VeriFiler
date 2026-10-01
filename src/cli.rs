@@ -1,4 +1,6 @@
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::algo::{self, Algorithm};
 
@@ -6,20 +8,20 @@ pub enum Command {
     Help,
     Version,
     Calculate {
-        file: String,
-        output: Option<String>,
+        file: PathBuf,
+        output: Option<PathBuf>,
         algorithms: Vec<Algorithm>,
         quiet: bool,
     },
     Verify {
-        file: String,
-        manifest: String,
+        file: PathBuf,
+        manifest: PathBuf,
         algorithms: Vec<Algorithm>,
     },
 }
 
-pub fn print_usage<W: Write>(w: &mut W) {
-    let _ = writeln!(
+pub fn print_usage<W: Write>(w: &mut W) -> std::io::Result<()> {
+    writeln!(
         w,
         "verifiler {} - portable file checksum calculator/verifier
 
@@ -41,6 +43,8 @@ COMMANDS:
     version      Show version.
 
 OPTIONS:
+    -h, --help             Show command help
+    --                     End options (allows filenames starting with '-')
     -o, --output <PATH>    (calculate) Manifest file to write (default: stdout)
     -a, --algos <LIST>     Comma-separated algorithm names; may be repeated
                            (e.g. -a md5,sha256 -a blake3). Default: all.
@@ -76,93 +80,100 @@ EXAMPLES:
     verifiler verify myfile.iso my.vf -a md5,blake3         check md5 and blake3",
         env!("CARGO_PKG_VERSION"),
         algs = algo::supported_names()
-    );
+    )
 }
 
-pub fn parse(args: &[String]) -> Result<Command, String> {
-    let mut it = args.iter();
-    let Some(cmd) = it.next() else {
+pub fn parse(args: &[OsString]) -> Result<Command, String> {
+    let Some(cmd) = args.first() else {
         return Ok(Command::Help);
     };
-
-    match cmd.as_str() {
-        "help" | "--help" | "-h" => Ok(Command::Help),
-        "version" | "--version" | "-V" => Ok(Command::Version),
-        "calculate" => {
-            let mut file: Option<String> = None;
-            let mut output: Option<String> = None;
-            let mut algorithms: Vec<Algorithm> = Vec::new();
-            let mut quiet = false;
-            let rest: Vec<String> = it.cloned().collect();
-            let mut i = 0;
-            while i < rest.len() {
-                let a = &rest[i];
-                match a.as_str() {
-                    "-o" | "--output" => {
-                        i += 1;
-                        output = Some(
-                            rest.get(i)
-                                .ok_or_else(|| "missing value for -o/--output".to_string())?
-                                .clone(),
-                        );
-                    }
-                    "-a" | "--algos" => {
-                        i += 1;
-                        let list = rest
-                            .get(i)
-                            .ok_or_else(|| "missing value for -a/--algos".to_string())?;
-                        algorithms = merge(algorithms, parse_algo_list(list)?);
-                    }
-                    "-q" | "--quiet" => quiet = true,
-                    _ => {
-                        if file.is_some() {
-                            return Err(format!("unexpected argument '{a}'"));
-                        }
-                        file = Some(a.clone());
-                    }
-                }
-                i += 1;
+    let cmd = cmd.to_str().ok_or("command must be UTF-8")?;
+    match cmd {
+        "help" | "--help" | "-h" | "version" | "--version" | "-V" => {
+            if args.len() != 1 {
+                return Err("unexpected arguments".into());
             }
-            let file = file.ok_or_else(|| "calculate requires a FILE argument".to_string())?;
-            Ok(Command::Calculate { file, output, algorithms, quiet })
+            return Ok(if matches!(cmd, "help" | "--help" | "-h") {
+                Command::Help
+            } else {
+                Command::Version
+            });
         }
-        "verify" => {
-            let mut file: Option<String> = None;
-            let mut manifest: Option<String> = None;
-            let mut algorithms: Vec<Algorithm> = Vec::new();
-            let rest: Vec<String> = it.cloned().collect();
-            let mut i = 0;
-            while i < rest.len() {
-                let a = &rest[i];
-                match a.as_str() {
-                    "-a" | "--algos" => {
-                        i += 1;
-                        let list = rest
-                            .get(i)
-                            .ok_or_else(|| "missing value for -a/--algos".to_string())?;
-                        algorithms = merge(algorithms, parse_algo_list(list)?);
-                    }
-                    _ => {
-                        if file.is_some() && manifest.is_some() {
-                            return Err(format!("unexpected argument '{a}'"));
-                        }
-                        if file.is_some() {
-                            manifest = Some(a.clone());
-                        } else {
-                            file = Some(a.clone());
-                        }
-                    }
-                }
-                i += 1;
-            }
-            let file =
-                file.ok_or_else(|| "verify requires two arguments: FILE MANIFEST".to_string())?;
-            let manifest =
-                manifest.ok_or_else(|| "verify requires two arguments: FILE MANIFEST".to_string())?;
-            Ok(Command::Verify { file, manifest, algorithms })
-        }
-        other => Err(format!("unknown command '{other}'")),
+        "calculate" | "verify" => {}
+        other => return Err(format!("unknown command '{other}'")),
     }
+    let mut files = Vec::new();
+    let mut output = None;
+    let mut algorithms = Vec::new();
+    let mut quiet = false;
+    let mut positional = false;
+    let mut it = args[1..].iter();
+    while let Some(arg) = it.next() {
+        if !positional {
+            match arg.to_str() {
+                Some("--") => {
+                    positional = true;
+                    continue;
+                }
+                Some("--help" | "-h") => return Ok(Command::Help),
+                Some("-o" | "--output") if cmd == "calculate" => {
+                    if output.is_some() {
+                        return Err("output specified more than once".into());
+                    }
+                    output = Some(PathBuf::from(value(&mut it, "-o/--output")?));
+                    continue;
+                }
+                Some("-a" | "--algos") => {
+                    let list = value(&mut it, "-a/--algos")?
+                        .to_str()
+                        .ok_or("algorithm names must be UTF-8")?;
+                    algorithms = merge(algorithms, parse_algo_list(list)?);
+                    continue;
+                }
+                Some("-q" | "--quiet") if cmd == "calculate" => {
+                    quiet = true;
+                    continue;
+                }
+                _ if arg.to_string_lossy().starts_with('-') => {
+                    return Err(format!("unknown option '{}'", arg.to_string_lossy()));
+                }
+                _ => {}
+            }
+        }
+        files.push(PathBuf::from(arg));
+    }
+    if cmd == "calculate" {
+        if files.len() != 1 {
+            return Err("calculate requires exactly one FILE argument".into());
+        }
+        Ok(Command::Calculate {
+            file: files.remove(0),
+            output,
+            algorithms,
+            quiet,
+        })
+    } else {
+        if files.len() != 2 {
+            return Err("verify requires exactly two arguments: FILE MANIFEST".into());
+        }
+        Ok(Command::Verify {
+            file: files.remove(0),
+            manifest: files.remove(0),
+            algorithms,
+        })
+    }
+}
+
+fn value<'a>(it: &mut std::slice::Iter<'a, OsString>, option: &str) -> Result<&'a OsStr, String> {
+    let value = it
+        .next()
+        .ok_or_else(|| format!("missing value for {option}"))?;
+    if value.is_empty() || value.to_string_lossy().starts_with('-') {
+        return Err(format!(
+            "missing value for {option}; use './' for paths starting with '-'"
+        ));
+    }
+    Ok(value)
 }
 
 fn merge(mut algos: Vec<Algorithm>, more: Vec<Algorithm>) -> Vec<Algorithm> {
@@ -178,7 +189,7 @@ fn parse_algo_list(list: &str) -> Result<Vec<Algorithm>, String> {
     let mut algos = Vec::new();
     for name in list.split(',') {
         if name.trim().is_empty() {
-            continue;
+            return Err(format!("empty algorithm name in '{list}'"));
         }
         let a = Algorithm::from_name(name)?;
         if !algos.contains(&a) {
