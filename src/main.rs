@@ -7,16 +7,14 @@ mod manifest;
 
 use manifest::ManifestEntry;
 
-pub const BUF_SIZE: usize = 128 * 1024;
-
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     let cmd = match cli::parse(&args) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("verifiler: {e}");
             eprintln!();
-            cli::print_usage(&mut std::io::stderr());
+            let _ = cli::print_usage(&mut std::io::stderr());
             std::process::exit(2);
         }
     };
@@ -26,50 +24,57 @@ fn main() {
 
 fn run(cmd: cli::Command) -> i32 {
     match cmd {
-        cli::Command::Help => {
-            cli::print_usage(&mut io::stdout());
-            0
-        }
+        cli::Command::Help => match cli::print_usage(&mut io::stdout()) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("verifiler: cannot write stdout: {e}");
+                1
+            }
+        },
         cli::Command::Version => {
-            println!("verifiler {}", env!("CARGO_PKG_VERSION"));
-            0
+            match writeln!(io::stdout(), "verifiler {}", env!("CARGO_PKG_VERSION")) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("verifiler: cannot write stdout: {e}");
+                    1
+                }
+            }
         }
-        cli::Command::Calculate { file, output, algorithms, quiet } => match calculate(
-            &file,
-            output.as_deref(),
-            &algorithms,
+        cli::Command::Calculate {
+            file,
+            output,
+            algorithms,
             quiet,
-        ) {
+        } => match calculate(&file, output.as_deref(), &algorithms, quiet) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("verifiler: {e}");
                 1
             }
         },
-        cli::Command::Verify { file, manifest, algorithms } => {
-            match verify(&file, &manifest, &algorithms) {
-                Ok(true) => 0,
-                Ok(false) => 1,
-                Err(e) => {
-                    eprintln!("verifiler: {e}");
-                    1
-                }
+        cli::Command::Verify {
+            file,
+            manifest,
+            algorithms,
+        } => match verify(&file, &manifest, &algorithms) {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(e) => {
+                eprintln!("verifiler: {e}");
+                1
             }
-        }
+        },
     }
 }
 
 fn calculate(
-    file: &str,
-    output: Option<&str>,
+    file: &Path,
+    output: Option<&Path>,
     algorithms: &[algo::Algorithm],
     quiet: bool,
 ) -> Result<(), String> {
-    if let Err(e) = std::fs::metadata(Path::new(file)) {
-        return Err(format!("cannot access '{file}': {e}"));
-    }
-    if !std::fs::metadata(Path::new(file)).map(|m| m.is_file()).unwrap_or(false) {
-        return Err(format!("'{file}' is not a regular file"));
+    if let Some(path) = output {
+        manifest::check_output(file, path)?;
     }
 
     let selected: Vec<algo::Algorithm> = if algorithms.is_empty() {
@@ -78,46 +83,39 @@ fn calculate(
         algorithms.to_vec()
     };
 
-    let mut entries = Vec::with_capacity(selected.len());
-    if selected.iter().any(|a| matches!(a, algo::Algorithm::Crc32)) {
-        entries.push(ManifestEntry { algorithm: "crc32".into(), hash: algo::crc32_hex(file)? });
-    }
-    let digest_algos: Vec<algo::Algorithm> = selected
+    let hashes = algo::digest_file_hex(file, &selected)?;
+    let entries: Vec<_> = selected
         .iter()
-        .copied()
-        .filter(|a| !matches!(a, algo::Algorithm::Crc32))
+        .zip(hashes)
+        .map(|(a, hash)| ManifestEntry {
+            algorithm: a.name().to_string(),
+            hash,
+        })
         .collect();
-    if !digest_algos.is_empty() {
-        let hashes = algo::digest_file_hex(file, &digest_algos)?;
-        for (a, h) in digest_algos.iter().zip(hashes) {
-            entries.push(ManifestEntry { algorithm: a.name().to_string(), hash: h });
-        }
-    }
 
-    match output {
-        Some(path) => {
-            manifest::write_manifest(path, &entries)
-                .map_err(|e| format!("cannot write '{path}': {e}"))?;
-            if !quiet {
-                for e in &entries {
-                    println!("{} {}", e.algorithm, e.hash);
-                }
-            }
+    if let Some(path) = output {
+        manifest::write_manifest(file, path, &entries)
+            .map_err(|e| format!("cannot write '{}': {e}", path.display()))?;
+    }
+    if output.is_none() || !quiet {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
+        for e in &entries {
+            writeln!(out, "{} {}", e.algorithm, e.hash)
+                .map_err(|e| format!("cannot write stdout: {e}"))?;
         }
-        None => {
-            for e in &entries {
-                println!("{} {}", e.algorithm, e.hash);
-            }
-        }
+        out.flush()
+            .map_err(|e| format!("cannot write stdout: {e}"))?;
     }
     Ok(())
 }
 
-fn verify(file: &str, manifest_path: &str, only: &[algo::Algorithm]) -> Result<bool, String> {
+fn verify(file: &Path, manifest_path: &Path, only: &[algo::Algorithm]) -> Result<bool, String> {
+    let manifest_name = manifest_path.display();
     let expected = manifest::parse_manifest(manifest_path)
-        .map_err(|e| format!("cannot read manifest '{manifest_path}': {e}"))?;
+        .map_err(|e| format!("cannot read manifest '{manifest_name}': {e}"))?;
     if expected.is_empty() {
-        return Err(format!("manifest '{manifest_path}' contains no checksums"));
+        return Err(format!("manifest '{manifest_name}' contains no checksums"));
     }
 
     let selected: Vec<&manifest::ManifestEntry> = if only.is_empty() {
@@ -129,7 +127,7 @@ fn verify(file: &str, manifest_path: &str, only: &[algo::Algorithm]) -> Result<b
             let found = expected
                 .iter()
                 .find(|e| e.algorithm == name)
-                .ok_or_else(|| format!("manifest '{manifest_path}' has no '{name}' checksum"))?;
+                .ok_or_else(|| format!("manifest '{manifest_name}' has no '{name}' checksum"))?;
             picked.push(found);
         }
         picked
@@ -153,25 +151,39 @@ fn verify(file: &str, manifest_path: &str, only: &[algo::Algorithm]) -> Result<b
         let entry = *entry;
         if actual.eq_ignore_ascii_case(&entry.hash) {
             ok_count += 1;
-            let _ = writeln!(out, "OK       {} {}", entry.algorithm, actual);
+            writeln!(out, "OK       {} {}", entry.algorithm, actual)
+                .map_err(|e| format!("cannot write stdout: {e}"))?;
         } else {
             all_ok = false;
-            let _ = writeln!(
+            writeln!(
                 err,
                 "FAIL     {} expected={} actual={}",
-                entry.algorithm,
-                entry.hash,
-                actual
-            );
+                entry.algorithm, entry.hash, actual
+            )
+            .map_err(|e| format!("cannot write stderr: {e}"))?;
         }
     }
 
     if all_ok {
-        let _ = writeln!(out, "{}/{} checksums matched: file is intact", ok_count, selected.len());
+        writeln!(
+            out,
+            "{}/{} checksums matched: file is intact",
+            ok_count,
+            selected.len()
+        )
+        .map_err(|e| format!("cannot write stdout: {e}"))?;
     } else {
-        let _ = writeln!(err, "{}/{} checksums matched: file is CORRUPTED", ok_count, selected.len());
+        writeln!(
+            err,
+            "{}/{} checksums matched: file is CORRUPTED",
+            ok_count,
+            selected.len()
+        )
+        .map_err(|e| format!("cannot write stderr: {e}"))?;
     }
-    let _ = out.flush();
-    let _ = err.flush();
+    out.flush()
+        .map_err(|e| format!("cannot write stdout: {e}"))?;
+    err.flush()
+        .map_err(|e| format!("cannot write stderr: {e}"))?;
     Ok(all_ok)
 }

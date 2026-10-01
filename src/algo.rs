@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::path::Path;
 
 use blake2::digest::{Digest, Update};
 use blake2::{Blake2b512, Blake2s256};
@@ -59,7 +60,12 @@ impl Algorithm {
         ALL.iter()
             .find(|a| a.name() == lower)
             .copied()
-            .ok_or_else(|| format!("unknown algorithm '{name}' (supported: {})", supported_names()))
+            .ok_or_else(|| {
+                format!(
+                    "unknown algorithm '{name}' (supported: {})",
+                    supported_names()
+                )
+            })
     }
 }
 
@@ -67,9 +73,24 @@ pub fn supported_names() -> String {
     ALL.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")
 }
 
-pub fn digest_file_hex(path: &str, algos: &[Algorithm]) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let mut reader = std::io::BufReader::with_capacity(BUF_SIZE, file);
+pub fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()));
+    }
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!("'{}' is not a regular file", path.display()));
+    }
+    Ok(file)
+}
+
+pub fn digest_file_hex(path: &Path, algos: &[Algorithm]) -> Result<Vec<String>, String> {
+    let mut reader = open_regular(path)?;
+    let before = reader.metadata().map_err(|e| e.to_string())?;
+    let mut bytes_read = 0u64;
 
     let mut md5 = algos.contains(&Algorithm::Md5).then(Md5::default);
     let mut sha1 = algos.contains(&Algorithm::Sha1).then(Sha1::default);
@@ -77,17 +98,26 @@ pub fn digest_file_hex(path: &str, algos: &[Algorithm]) -> Result<Vec<String>, S
     let mut sha512 = algos.contains(&Algorithm::Sha512).then(Sha512::default);
     let mut sha3_256 = algos.contains(&Algorithm::Sha3_256).then(Sha3_256::default);
     let mut sha3_512 = algos.contains(&Algorithm::Sha3_512).then(Sha3_512::default);
-    let mut blake2b = algos.contains(&Algorithm::Blake2b512).then(Blake2b512::default);
-    let mut blake2s = algos.contains(&Algorithm::Blake2s256).then(Blake2s256::default);
+    let mut blake2b = algos
+        .contains(&Algorithm::Blake2b512)
+        .then(Blake2b512::default);
+    let mut blake2s = algos
+        .contains(&Algorithm::Blake2s256)
+        .then(Blake2s256::default);
     let mut blake3 = algos.contains(&Algorithm::Blake3).then(Blake3::new);
     let mut crc32 = algos.contains(&Algorithm::Crc32).then(Crc32::new);
 
     let mut buf = vec![0u8; BUF_SIZE];
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("read error: {e}"))?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read error: {e}")),
+        };
         if n == 0 {
             break;
         }
+        bytes_read += n as u64;
         let chunk = &buf[..n];
         if let Some(h) = md5.as_mut() {
             Update::update(h, chunk);
@@ -121,6 +151,17 @@ pub fn digest_file_hex(path: &str, algos: &[Algorithm]) -> Result<Vec<String>, S
         }
     }
 
+    let after = reader.metadata().map_err(|e| e.to_string())?;
+    if before.len() != bytes_read
+        || after.len() != bytes_read
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err(format!(
+            "'{}' changed while checksums were being calculated",
+            path.display()
+        ));
+    }
+
     let finish = |a: &Algorithm| -> String {
         match a {
             Algorithm::Md5 => hex(md5.as_mut().unwrap().finalize_reset()),
@@ -136,10 +177,6 @@ pub fn digest_file_hex(path: &str, algos: &[Algorithm]) -> Result<Vec<String>, S
         }
     };
     Ok(algos.iter().map(finish).collect())
-}
-
-pub fn crc32_hex(path: &str) -> Result<String, String> {
-    digest_file_hex(path, &[Algorithm::Crc32]).map(|v| v[0].clone())
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {
