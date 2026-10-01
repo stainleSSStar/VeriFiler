@@ -184,7 +184,7 @@ The manifest can be edited manually (e.g. keep only the algorithms you trust), t
 - Manifest output is written and synced to a temporary file in the destination directory, then atomically replaces the destination. A failed write leaves the previous manifest intact.
 - Observable length or modification-time changes while hashing cause an error. This is a best-effort check; files should remain unchanged during calculation/verification.
 - Use `--` before positional filenames that start with `-`; for `-o`, use a path such as `./-manifest.vf`.
-- File paths need not be UTF-8 on Unix.
+- Native file paths are supported, including Unicode names and non-UTF-8 names on filesystems that allow them.
 
 ## Performance & memory
 

@@ -540,7 +540,7 @@ fn option_terminator_allows_dash_filenames() {
         .success();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn paths_need_not_be_utf8() {
     use std::os::unix::ffi::OsStringExt;
@@ -658,4 +658,25 @@ fn multichunk_binary_matches_independent_vectors() {
         .assert()
         .success()
         .stdout(expected);
+}
+
+#[test]
+fn unicode_paths_roundtrip() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let data = dir.child("zażółć gęślą jaźń.bin");
+    let manifest = dir.child("sumy kontrolne żółć.vf");
+    data.write_binary(b"abc").unwrap();
+    bin()
+        .arg("calculate")
+        .arg(data.path())
+        .arg("-o")
+        .arg(manifest.path())
+        .assert()
+        .success();
+    bin()
+        .arg("verify")
+        .arg(data.path())
+        .arg(manifest.path())
+        .assert()
+        .success();
 }
